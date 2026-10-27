@@ -1,6 +1,7 @@
 name: just_audio_media_kit
 description: package:media_kit bindings for just_audio to support Linux and Windows.
 version: 2.1.0
+publish_to: none
 repository: https://github.com/Pato05/just_audio_media_kit
 
 environment:
@@ -11,7 +12,11 @@ dependencies:
   flutter:
     sdk: flutter
   logging: ^1.2.0
-  just_audio_platform_interface: ^4.5.0
+  just_audio_platform_interface:
+    git:
+      url: https://github.com/Francisny03/just_audio.git
+      path: just_audio_platform_interface
+      ref: 49b633b2571d1cf670f1f296f5febc9b3010df96
   media_kit: ^1.2.0
   universal_platform: ^1.0.0+1
 

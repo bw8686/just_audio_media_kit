@@ -4,14 +4,14 @@ library;
 import 'dart:collection';
 
 import 'package:flutter/services.dart';
-import 'package:just_audio_media_kit/src/mediakit_player.dart';
+import 'package:just_audio_media_kit/mediakit_player.dart';
 import 'package:just_audio_platform_interface/just_audio_platform_interface.dart';
 import 'package:logging/logging.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:universal_platform/universal_platform.dart';
 
 class JustAudioMediaKit extends JustAudioPlatform {
-  JustAudioMediaKit._();
+  JustAudioMediaKit();
 
   /// The internal MPV player's logLevel
   static MPVLogLevel mpvLogLevel = MPVLogLevel.error;
@@ -48,11 +48,9 @@ class JustAudioMediaKit extends JustAudioPlatform {
   /// [the related issue](https://github.com/Pato05/just_audio_media_kit/issues/11) for more information
   static bool prefetchPlaylist = false;
 
-  /// Path to PEM client certificate file for mTLS.
-  static String? tlsCertFile;
-
-  /// Path to PEM private key file for mTLS.
-  static String? tlsKeyFile;
+  /// Properties applied to each native player before it is exposed to just_audio.
+  /// Useful for a local proxy whose URL resolution exceeds MPV's default timeout.
+  static Map<String, String> nativeProperties = const {};
 
   static final _logger = Logger('JustAudioMediaKit');
   final _players = HashMap<String, MediaKitPlayer>();
@@ -71,10 +69,14 @@ class JustAudioMediaKit extends JustAudioPlatform {
     bool iOS = false,
     bool macOS = false,
 
+    /// Optional title for the native player window and process.
+    String? title,
+
     /// The path to the libmpv dynamic library.
     /// The name of the library is generally `libmpv.so` on GNU/Linux and `libmpv-2.dll` on Windows.
     String? libmpv,
   }) {
+    if (title != null) JustAudioMediaKit.title = title;
     if ((UniversalPlatform.isLinux && linux) ||
         (UniversalPlatform.isWindows && windows) ||
         (UniversalPlatform.isAndroid && android) ||
@@ -87,7 +89,7 @@ class JustAudioMediaKit extends JustAudioPlatform {
 
   /// Registers the plugin with [JustAudioPlatform]
   static void registerWith() {
-    JustAudioPlatform.instance = JustAudioMediaKit._();
+    JustAudioPlatform.instance = JustAudioMediaKit();
   }
 
   @override

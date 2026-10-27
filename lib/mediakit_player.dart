@@ -1,10 +1,13 @@
+library;
+
 import 'dart:async';
 
+import 'package:flutter/services.dart';
 import 'package:just_audio_media_kit/just_audio_media_kit.dart';
 import 'package:just_audio_platform_interface/just_audio_platform_interface.dart';
 import 'package:logging/logging.dart';
 import 'package:media_kit/media_kit.dart';
-import 'set_property.dart';
+import 'src/set_property.dart';
 
 /// An [AudioPlayerPlatform] which wraps `package:media_kit`'s [Player]
 class MediaKitPlayer extends AudioPlayerPlatform {
@@ -19,7 +22,16 @@ class MediaKitPlayer extends AudioPlayerPlatform {
   final _readyCompleter = Completer<void>();
 
   /// Completes when the player is ready
-  Future<void> ready() => _readyCompleter.future;
+  Future<void>? _configured;
+
+  Future<void> ready() => _configured ??= _configureNativePlayer();
+
+  Future<void> _configureNativePlayer() async {
+    await _readyCompleter.future;
+    for (final property in JustAudioMediaKit.nativeProperties.entries) {
+      await setProperty(_player, property.key, property.value);
+    }
+  }
 
   static final _logger = Logger('MediaKitPlayer');
 
@@ -31,10 +43,14 @@ class MediaKitPlayer extends AudioPlayerPlatform {
   Duration _position = Duration.zero;
   Duration? _duration;
   bool _playing = false;
+  bool _shuffleModeEnabled = false;
   bool _mediaOpened = false;
   int? _errorCode;
   String? _errorMessage;
   Completer<Duration?>? _loadCompleter;
+  String? _loadFailure;
+  int _loadGeneration = 0;
+  Future<void> _nativeOpenTail = Future<void>.value();
 
   /// The index that's currently playing
   int _currentIndex = 0;
@@ -62,20 +78,15 @@ class MediaKitPlayer extends AudioPlayerPlatform {
     if (JustAudioMediaKit.prefetchPlaylist) {
       setProperty(_player, 'prefetch-playlist', 'yes');
     }
-    if (JustAudioMediaKit.tlsCertFile != null) {
-      setProperty(_player, 'tls-cert-file', JustAudioMediaKit.tlsCertFile!);
-    }
-    if (JustAudioMediaKit.tlsKeyFile != null) {
-      setProperty(_player, 'tls-key-file', JustAudioMediaKit.tlsKeyFile!);
-    }
 
     _streamSubscriptions = [
       _player.stream.duration.listen((duration) {
         if (_currentMedia?.extras?['overrideDuration'] != null) return;
 
         if (_setPosition != null && duration.inSeconds > 0) {
-          unawaited(_player.seek(_setPosition!));
+          final position = _setPosition!;
           _setPosition = null;
+          unawaited(_player.seek(position));
         }
         _updateDuration(duration);
         _updatePlaybackEvent();
@@ -132,12 +143,22 @@ class MediaKitPlayer extends AudioPlayerPlatform {
         _dataController.add(PlayerDataMessage(volume: volume / 100.0));
       }),
       _player.stream.completed.listen((completed) {
+        // MPV can report completion for the playlist being replaced while a
+        // new YTM URL is still loading. It must not advance the new playlist.
+        if (!completed ||
+            !_mediaOpened ||
+            _processingState == ProcessingStateMessage.loading) {
+          return;
+        }
         _bufferedPosition = _position = Duration.zero;
-        if (completed &&
-            // is at the end of the [Playlist]
-            _currentIndex == _player.state.playlist.medias.length - 1 &&
-            // is not looping (technically this shouldn't be fired if the player is looping)
-            _player.state.playlistMode == PlaylistMode.none) {
+        final atPlaylistEnd =
+            _currentIndex == _player.state.playlist.medias.length - 1;
+        // Saturn's audio handler advances through just_audio's shuffle order.
+        // Report each shuffled track's end, not only the end of the native
+        // playlist, so it can select the next canonical queue index.
+        if (_shuffleModeEnabled ||
+            (atPlaylistEnd &&
+                _player.state.playlistMode == PlaylistMode.none)) {
           _processingState = ProcessingStateMessage.completed;
         }
         _errorCode = null;
@@ -152,6 +173,11 @@ class MediaKitPlayer extends AudioPlayerPlatform {
           _errorCode = kErrorCode;
           _errorMessage = error;
           _updatePlaybackEvent();
+          final pendingLoad = _loadCompleter;
+          if (pendingLoad != null && !pendingLoad.isCompleted) {
+            _loadFailure = error;
+            pendingLoad.complete(null);
+          }
         }
         _logger.severe('ERROR OCCURRED: $error');
       }),
@@ -175,7 +201,7 @@ class MediaKitPlayer extends AudioPlayerPlatform {
       }),
       _player.stream.log.listen((event) {
         // ignore: avoid_print
-        print("MPV: [${event.level}] ${event.prefix}: ${event.text}");
+        print('MPV: [${event.level}] ${event.prefix}: ${event.text}');
       }),
     ];
   }
@@ -231,39 +257,63 @@ class MediaKitPlayer extends AudioPlayerPlatform {
   @override
   Future<LoadResponse> load(LoadRequest request) async {
     _logger.finest('load(${request.toMap()})');
+    // A new playlist open interrupts the previous one. Release its waiter so
+    // just_audio can discard that load instead of keeping it pending forever.
+    final previousLoad = _loadCompleter;
+    if (previousLoad != null && !previousLoad.isCompleted) {
+      previousLoad.complete(null);
+    }
+    final generation = ++_loadGeneration;
+    _loadFailure = null;
     _mediaOpened = false;
-    _loadCompleter = Completer();
+    final loadCompleter = _loadCompleter = Completer<Duration?>();
     _currentIndex = request.initialIndex ?? 0;
     _bufferedPosition = Duration.zero;
     _position = Duration.zero;
     _duration = null;
+    _setPosition = null;
     _processingState = ProcessingStateMessage.loading;
     _errorCode = null;
     _errorMessage = null;
     _updatePlaybackEvent();
 
+    final Playable playable;
     if (request.audioSourceMessage is ConcatenatingAudioSourceMessage) {
       final audioSource =
           request.audioSourceMessage as ConcatenatingAudioSourceMessage;
-      final playable = Playlist(
-          audioSource.children.map(_convertAudioSourceIntoMediaKit).toList(),
-          index: _currentIndex);
-
-      await _player.open(playable, play: _playing);
+      playable = Playlist(
+        audioSource.children.map(_convertAudioSourceIntoMediaKit).toList(),
+        index: _currentIndex,
+      );
     } else {
-      final playable =
-          _convertAudioSourceIntoMediaKit(request.audioSourceMessage);
-      _logger.finest('playable is ${playable.toString()}');
+      playable = _convertAudioSourceIntoMediaKit(request.audioSourceMessage);
+    }
+    // Native MPV serializes playlist opens. Drop superseded loads before they
+    // enter that queue, so rapid skips do not open every intermediate song.
+    final openRequest = _nativeOpenTail.then((_) async {
+      if (generation != _loadGeneration) return;
       await _player.open(playable, play: _playing);
+    });
+    _nativeOpenTail = openRequest.catchError((Object _, StackTrace __) {});
+    await openRequest;
+    if (generation != _loadGeneration) {
+      return LoadResponse(duration: null);
     }
     _mediaOpened = true;
 
-    if (request.initialPosition != null) {
+    if (request.initialPosition != null &&
+        request.initialPosition != Duration.zero) {
       _setPosition = _position = request.initialPosition!;
     }
 
     _updatePlaybackEvent();
-    final duration = await _loadCompleter?.future;
+    final duration = await loadCompleter.future;
+    if (generation != _loadGeneration) {
+      return LoadResponse(duration: null);
+    }
+    if (_loadFailure case final error?) {
+      throw PlatformException(code: '$kErrorCode', message: error);
+    }
     return LoadResponse(duration: duration);
   }
 
@@ -310,13 +360,24 @@ class MediaKitPlayer extends AudioPlayerPlatform {
   @override
   Future<SetShuffleModeResponse> setShuffleMode(
       SetShuffleModeRequest request) async {
-    bool shuffling = request.shuffleMode != ShuffleModeMessage.none;
-    await _player.setShuffle(shuffling);
-
+    _shuffleModeEnabled = request.shuffleMode != ShuffleModeMessage.none;
+    // Native shuffle chooses a different random order than just_audio, while
+    // the handler and queue screen use just_audio's effectiveIndices.
+    await _player.setShuffle(false);
     _dataController.add(PlayerDataMessage(
-        shuffleMode:
-            shuffling ? ShuffleModeMessage.all : ShuffleModeMessage.none));
+        shuffleMode: _shuffleModeEnabled
+            ? ShuffleModeMessage.all
+            : ShuffleModeMessage.none));
     return SetShuffleModeResponse();
+  }
+
+  @override
+  Future<SetShuffleOrderResponse> setShuffleOrder(
+      SetShuffleOrderRequest request) async {
+    // The handler uses the order in this request to choose the next track
+    // when this adapter reports completion. MPV keeps canonical indexes so
+    // seek(index) and queue edits continue to address the same source.
+    return SetShuffleOrderResponse();
   }
 
   @override
@@ -334,7 +395,12 @@ class MediaKitPlayer extends AudioPlayerPlatform {
       final start = _currentMedia?.start;
       var nativePosition = position;
       if (start != null) nativePosition += start;
-      if (_player.state.duration.inSeconds > 0) {
+      // jump(index) already starts at zero. A second native seek races the
+      // next playlist load when the user skips through YTM tracks quickly.
+      if (request.index != null && nativePosition == Duration.zero) {
+        _setPosition = null;
+      } else if (_player.state.duration.inSeconds > 0) {
+        _setPosition = null;
         await _player.seek(nativePosition);
       } else {
         _setPosition = nativePosition;
@@ -352,15 +418,22 @@ class MediaKitPlayer extends AudioPlayerPlatform {
   Future<ConcatenatingInsertAllResponse> concatenatingInsertAll(
       ConcatenatingInsertAllRequest request) async {
     // _logger.fine('concatenatingInsertAll(${request.toMap()})');
-    for (final source in request.children) {
+    final originalLength = _player.state.playlist.medias.length;
+    for (var i = 0; i < request.children.length; i++) {
+      final source = request.children[i];
       await _player.add(_convertAudioSourceIntoMediaKit(source));
 
       final length = _player.state.playlist.medias.length;
 
-      if (length == 0 || length == 1) continue;
-
-      if (request.index < (length - 1) && request.index >= 0) {
-        await _player.move(length, request.index);
+      // media_kit indexes the newly appended source at length - 1. The old
+      // code passed `length`, which is one past the end, to playlist-move.
+      // Insert each batch item after the previously inserted item.
+      final target = request.index < 0
+          ? length - 1
+          : request.index + i;
+      final sourceIndex = originalLength + i;
+      if (target >= 0 && target < length - 1 && sourceIndex < length) {
+        await _player.move(sourceIndex, target);
       }
     }
 
